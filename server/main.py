@@ -57,14 +57,28 @@ class Task(BaseModel):
 #     tone:str=Field(...,description="write tone (e.g.. practical crisp)")
 #     tasks:List[Task]
 
+# class Plan(BaseModel):
+#     blog_title:str
+#     audience:str
+#     tone:str
+#     blog_kind=Literal("explainer","tutorial","news_roundup","comparison","system_design")
+#     constraints:List[str]=Field(default_factory=list)
+#     # tone:str=Field(...,description="write tone (e.g.. practical crisp)")
+#     tasks:List[Task]
+
 class Plan(BaseModel):
-    blog_title:str
-    audience:str
-    tone:str
-    blog_kind=Literal("explainer","tutorial","news_roundup","comparison","system_design")="explainer"
-    constraints:List[str]=Field(default_factory=list)
-    # tone:str=Field(...,description="write tone (e.g.. practical crisp)")
-    tasks:List[Task]
+    blog_title: str
+    audience: str
+    tone: str
+    blog_kind: Literal[
+        "explainer",
+        "tutorial",
+        "news_roundup",
+        "comparison",
+        "system_design"
+    ]
+    constraints: List[str] = Field(default_factory=list)
+    tasks: List[Task]
     
 class EvidenceItem(BaseModel):
     title: str
@@ -92,19 +106,27 @@ class State(TypedDict):
     sections:Annotated[List[tuple[int,str]],operator.add]
     final:str
     
-llm_groq = ChatGroq(
-    model="openai/gpt-oss-120b",
-    api_key=GROQ_API_KEY,
-    temperature=1,
-    max_tokens=4000,
-)
+# llm_groq = ChatGroq(
+#     model="openai/gpt-oss-120b",
+#     api_key=GROQ_API_KEY,
+#     temperature=1,
+#     max_tokens=3000,
+# )
 
-llm_nvidia = ChatNVIDIA(
+# llm_nvidia = ChatNVIDIA(
+#     model="nvidia/nemotron-3-super-120b-a12b",
+#     api_key=NVIDIA_API_KEY , 
+#     temperature=1,
+#     top_p=1,
+#     max_completion_tokens=1024,
+#     seed=42,
+# )
+llm_groq = ChatNVIDIA(
     model="nvidia/nemotron-3-super-120b-a12b",
     api_key=NVIDIA_API_KEY , 
     temperature=1,
     top_p=1,
-    max_completion_tokens=1024,
+    max_completion_tokens=3000,
     seed=42,
 )
 
@@ -227,31 +249,99 @@ def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
 
     return normalized
 
-def research_node(state:State)->dict:
-    queries=state.get("queries",[] or [])
-    max_result=6
-    raw_results= List[dict]=[]
-    
-    for q in queries:
-         raw_results.extend(_tavily_search(q,max_result=max_result))
-         
-    if not raw_results:
-        return {"evidence":[]}
+# def research_node(state: State) -> dict:
 
-    extractor =llm_groq.with_structured_output(EvidencePack)
-    pack=extractor.invoke(
+#     queries = state.get("queries", [])
+#     max_result = 2
+
+#     raw_results: List[dict] = []
+
+#     for q in queries:
+#         print("q -->>",q)
+#         raw_results.extend(
+#             _tavily_search(q, max_results=max_result)
+#         )
+
+#     if not raw_results:
+#         return {"evidence": []}
+
+#     extractor = llm_groq.with_structured_output(EvidencePack)
+
+#     pack = extractor.invoke(
+#         [
+#             SystemMessage(content=RESEARCH_SYSTEM),
+#             HumanMessage(
+#                 content=f"raw_result:\n{raw_results}"
+#             ),
+#         ]
+#     )
+
+#     dedup = {}
+
+#     for e in pack.evidence:
+#         if e.url:
+#             dedup[e.url] = e
+
+#     return {
+#         "evidence": list(dedup.values())
+#     }
+    
+def research_node(state: State) -> dict:
+
+    queries = state.get("queries", [])
+
+    MAX_RESULTS_PER_QUERY = 1
+    MAX_CONTENT_CHARS = 800
+    MAX_TOTAL_RESULTS = 6
+
+    raw_results: List[dict] = []
+
+    for q in queries:
+
+        results = _tavily_search(
+            q,
+            max_results=MAX_RESULTS_PER_QUERY
+        )
+
+        raw_results.extend(results)
+
+    # Keep only a limited number of results
+    raw_results = raw_results[:MAX_TOTAL_RESULTS]
+
+    # Reduce the amount of text
+    research_context = []
+
+    for result in raw_results:
+
+        research_context.append({
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "content": result.get("content", "")[:MAX_CONTENT_CHARS]
+        })
+
+    if not research_context:
+        return {"evidence": []}
+
+    extractor = llm_groq.with_structured_output(EvidencePack)
+
+    pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(content=f"raw_result:\n{raw_results}"),
+            HumanMessage(
+                content=f"Research results:\n{research_context}"
+            ),
         ]
     )
-    dedup={}
+
+    dedup = {}
+
     for e in pack.evidence:
         if e.url:
-            dedup[e.url]=e
-            
-    return {"evidence":list(dedup.values())}
-            
+            dedup[e.url] = e
+
+    return {
+        "evidence": list(dedup.values())
+    }
     
     
 def router_node(state: dict) -> dict:
@@ -388,29 +478,28 @@ def worker_node(payload: dict) -> dict:
             for e in evidence[:20]
         )
 
-    section_md = llm.invoke(
+    section_md = llm_groq.invoke(
         [
             SystemMessage(content=WORKER_SYSTEM),
             HumanMessage(
-                content=(
-                    f"Blog title: {plan.blog_title}\n"
-                    f"Audience: {plan.audience}\n"
-                    f"Tone: {plan.tone}\n"
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Constraints: {plan.constraints}\n"
-                    f"Topic: {topic}\n"
-                    f"Mode: {mode}\n\n"
-                    f"Section title: {task.title}\n"
-                    f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words}\n"
-                    f"Tags: {task.tags}\n"
-                    f"requires_research: {task.requires_research}\n"
-                    f"requires_citations: {task.requires_citations}\n"
-                    f"requires_code: {task.requires_code}\n"
-                    f"Bullets:{bullets_text}\n\n"
-                    f"Evidence (ONLY use these URLs when citing):\n"
-                    f"{evidence_text}"
-                )
+                 content=(
+        f"Blog title: {plan.blog_title}\n"
+        f"Audience: {plan.audience}\n"
+        f"Tone: {plan.tone}\n"
+        f"Blog kind: {plan.blog_kind}\n"
+        f"Constraints: {plan.constraints}\n"
+        f"Topic: {topic}\n"
+        f"Mode: {mode}\n\n"
+
+        f"Section title: {task.title}\n"
+        f"Goal: {task.goal}\n"
+        f"Target words: {task.target_words}\n"
+        f"Section type: {task.section_type}\n"
+        f"Bullets:\n{bullets_text}\n\n"
+
+        f"Evidence (ONLY use these URLs when citing):\n"
+        f"{evidence_text}"
+    )
             ),
         ]
     ).content.strip()
@@ -472,299 +561,63 @@ def worker_node(payload: dict) -> dict:
 #     return {"section":[section_md]}
     
 
-def reducer(state: State) -> dict:
+def reducer_node(state: State) -> dict:
 
-    title = state["plan"].blog_title
-    body = "\n\n".join(state["sections"]).strip()
+    plan = state["plan"]
 
-    final_md = f"# {title}\n\n{body}\n"
+    ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
+    body = "\n\n".join(ordered_sections).strip()
+    final_md = f"# {plan.blog_title}\n\n{body}\n"
 
-    # ----- save to file -----
-    filename = title.lower().replace(" ", "_") + ".md"
-    output_path = Path(filename)
-    output_path.write_text(final_md, encoding="utf-8")
+    filename = f"{plan.blog_title}.md"
+    Path(filename).write_text(final_md, encoding="utf-8")
 
     return {"final": final_md}
 
-agent=StateGraph(State)
-agent.add_node("orchestrator",orchestrator)
-agent.add_node("worker",worker)
-agent.add_node("reducer",reducer)
 
-agent.add_edge(START,"orchestrator")
+
+agent=StateGraph(State)
+
+agent.add_node("router",router_node)
+agent.add_node("research",research_node)
+agent.add_node("orchestrator",orchestrator_node)
+agent.add_node("worker",worker_node)
+agent.add_node("reducer",reducer_node)
+
+agent.add_edge(START,"router")
+agent.add_conditional_edges("router" , router_next,{"research":"research","orchestrator":"orchestrator"})
+agent.add_edge("research","orchestrator")
+
 agent.add_conditional_edges("orchestrator",fanout,["worker"])
 agent.add_edge("worker","reducer")
 agent.add_edge("reducer",END)
 
+
+# agent.add_node("orchestrator",orchestrator)
+# agent.add_node("worker",worker)
+# agent.add_node("reducer",reducer)
+# agent.add_edge(START,"orchestrator")
+# agent.add_conditional_edges("orchestrator",fanout,["worker"])
+# agent.add_edge("worker","reducer")
+# agent.add_edge("reducer",END)
+
 app=agent.compile()
 
-result=app.invoke({"topic":"write a blog on self attention","section":[]})
-print("planer agent response -->>",result)
-
-
-
-
-
-
-
-
-
-
-
-
-
-# from __future__ import annotations
-
-# from typing import TypedDict, List, Annotated
-# from langgraph.graph import StateGraph, START, END
-# from langchain_nvidia_ai_endpoints import ChatNVIDIA
-# from langchain_core.messages import SystemMessage, HumanMessage
-# from pydantic import BaseModel, Field
-# from langchain_groq import ChatGroq
-# from langgraph.types import Send
-# from dotenv import load_dotenv
-# from pathlib import Path
-# import operator
-# import os
-
-
-# load_dotenv()
-
-# GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-
-
-# # --------------------------------------------------
-# # 1. Task schema
-# # --------------------------------------------------
-
-# class Task(BaseModel):
-#     id: int
-#     title: str
-#     brief: str = Field(..., description="what to cover")
-
-
-# # --------------------------------------------------
-# # 2. Plan schema
-# # --------------------------------------------------
-
-# class Plan(BaseModel):
-#     blog_title: str
-#     tasks: List[Task]
-
-
-# # --------------------------------------------------
-# # 3. LangGraph State
-# # --------------------------------------------------
-
-# class State(TypedDict):
-#     topic: str
-#     plan: Plan
-#     sections: Annotated[List[str], operator.add]
-#     final: str
-
-
-# # --------------------------------------------------
-# # 4. LLM
-# # --------------------------------------------------
-
-# llm_groq = ChatGroq(
-#     model="openai/gpt-oss-120b",
-#     api_key=GROQ_API_KEY,
-#     temperature=1,
-#     max_tokens=1024,
-# )
-
-
-# llm_nvidia = ChatNVIDIA(
-#     model="nvidia/nemotron-3-super-120b-a12b",
-#     api_key=NVIDIA_API_KEY,
-#     temperature=1,
-#     top_p=1,
-#     max_completion_tokens=1024,
-#     seed=42,
-# )
-
-
-# # --------------------------------------------------
-# # 5. Orchestrator
-# # --------------------------------------------------
-
-# def orchestrator(state: State) -> dict:
-
-#     plan = llm_groq.with_structured_output(Plan).invoke(
-#         [
-#             SystemMessage(
-#                 content=(
-#                     "Create a blog plan with 5-7 sections "
-#                     "on the following topic."
-#                 )
-#             ),
-#             HumanMessage(
-#                 content=f"Topic: {state['topic']}"
-#             )
-#         ]
-#     )
-
-#     return {
-#         "plan": plan
-#     }
-
-
-# # --------------------------------------------------
-# # 6. Fanout
-# # --------------------------------------------------
-
-# def fanout(state: State):
-
-#     return [
-#         Send(
-#             "worker",
-#             {
-#                 "task": task,
-#                 "topic": state["topic"],
-#                 "plan": state["plan"]
-#             }
-#         )
-#         for task in state["plan"].tasks
-#     ]
-
-
-# # --------------------------------------------------
-# # 7. Worker
-# # --------------------------------------------------
-
-# def worker(payload: dict) -> dict:
-
-#     task = payload["task"]
-#     topic = payload["topic"]
-#     plan = payload["plan"]
-
-#     blog_title = plan.blog_title
-
-#     section_md = llm_groq.invoke(
-#         [
-#             SystemMessage(
-#                 content="Write one clean Markdown section."
-#             ),
-
-#             HumanMessage(
-#                 content=(
-#                     f"Blog: {blog_title}\n"
-#                     f"Topic: {topic}\n"
-#                     f"Section: {task.title}\n"
-#                     f"Brief: {task.brief}\n"
-#                     "Return only the section content in Markdown."
-#                 )
-#             ),
-#         ]
-#     ).content.strip()
-
-#     return {
-#         "sections": [section_md]
-#     }
-
-
-# # --------------------------------------------------
-# # 8. Reducer
-# # --------------------------------------------------
-
-# def reducer(state: State) -> dict:
-
-#     title = state["plan"].blog_title
-
-#     body = "\n\n".join(
-#         state["sections"]
-#     ).strip()
-
-#     final_md = f"# {title}\n\n{body}\n"
-
-#     # Save to file
-#     filename = (
-#         title.lower()
-#         .replace(" ", "_")
-#         + ".md"
-#     )
-
-#     output_path = Path(filename)
-
-#     output_path.write_text(
-#         final_md,
-#         encoding="utf-8"
-#     )
-
-#     return {
-#         "final": final_md
-#     }
-
-
-# # --------------------------------------------------
-# # 9. Build Graph
-# # --------------------------------------------------
-
-# agent = StateGraph(State)
-
-# agent.add_node(
-#     "orchestrator",
-#     orchestrator
-# )
-
-# agent.add_node(
-#     "worker",
-#     worker
-# )
-
-# agent.add_node(
-#     "reducer",
-#     reducer
-# )
-
-
-# # START
-# agent.add_edge(
-#     START,
-#     "orchestrator"
-# )
-
-
-# # Orchestrator → dynamic workers
-# agent.add_conditional_edges(
-#     "orchestrator",
-#     fanout,
-#     ["worker"]
-# )
-
-
-# # Worker → reducer
-# agent.add_edge(
-#     "worker",
-#     "reducer"
-# )
-
-
-# # Reducer → END
-# agent.add_edge(
-#     "reducer",
-#     END
-# )
-
-
-# # Compile
-# app = agent.compile()
-
-
-# # --------------------------------------------------
-# # 10. Run
-# # --------------------------------------------------
-
-# result = app.invoke(
-#     {
-#         "topic": "write a blog on self attention",
-#         "sections": []
-#     }
-# )
-
-# print(
-#     "planner agent response -->",
-#     result
-# )
+def run(topic: str):
+    out = app.invoke(
+        {
+            "topic": topic,
+            "mode": "",
+            "needs_research": False,
+            "queries": [],
+            "evidence": [],
+            "plan": None,
+            "sections": [],
+            "final": "",
+        }
+    )
+
+    return out
+
+# result=app.invoke({"topic":"write a blog on self attention","section":[]})
+print("planer agent response -->>",run("write a blog about the gpt 6 astra"))
