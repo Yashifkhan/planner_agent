@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 tool = TavilySearchResults(max_results=2)
 
 result = tool.invoke({
