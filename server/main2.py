@@ -13,14 +13,18 @@ from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, Field
+import json
+from langchain_core.messages import AIMessage
+from pydantic import BaseModel, Field, ValidationError
 
 load_dotenv()
 
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 MODEL_NAME = os.getenv("PLANNER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 OUTPUT_DIR = Path(os.getenv("PLANNER_OUTPUT_DIR", "outputs"))
+MAX_QUERIES = int(os.getenv("PLANNER_MAX_QUERIES", "5"))
 
-print("NVIDIA_API_KEY",NVIDIA_API_KEY)
+# print("NVIDIA_API_KEY",NVIDIA_API_KEY)
 # --------------------------------------------------
 # 1) Schemas
 # --------------------------------------------------
@@ -108,12 +112,46 @@ class State(TypedDict):
 llm = ChatNVIDIA(
     model=MODEL_NAME,
     api_key=NVIDIA_API_KEY,
-    temperature=1,
+    temperature=0.7,
     top_p=1,
-    max_completion_tokens=4096,  # 3000 could cut long sections
+    max_completion_tokens=4096,
+    timeout=180,        # default 60 tha
     seed=42,
 )
 
+
+def _extract_json(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)  # reasoning models
+    text = re.sub(r"```(?:json)?", "", text)                    # markdown fences
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object found in model output")
+    return text[start : end + 1]
+
+
+def structured_invoke(schema: type[BaseModel], messages: list, retries: int = 3):
+    schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    msgs = [
+        *messages,
+        HumanMessage(
+            content=(
+                "Respond with ONLY one valid JSON object that matches this JSON Schema. "
+                "No markdown, no commentary.\n\nSchema:\n" + schema_json
+            )
+        ),
+    ]
+    last_err = None
+    for _ in range(retries):
+        out = llm.invoke(msgs)
+        try:
+            return schema.model_validate_json(_extract_json(out.content))
+        except (ValueError, ValidationError) as e:
+            last_err = e
+            msgs += [
+                AIMessage(content=out.content),
+                HumanMessage(content=f"Invalid output: {e}\nReturn the corrected JSON only."),
+            ]
+    raise RuntimeError(f"Structured output failed after {retries} tries: {last_err}")
 
 # --------------------------------------------------
 # 3) Prompts
@@ -272,12 +310,16 @@ def research_node(state: State) -> dict:
         return {"evidence": []}
 
     extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
-        [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(content=f"Research results:\n{research_context}"),
-        ]
-    )
+    # pack = extractor.invoke(
+    #     [
+    #         SystemMessage(content=RESEARCH_SYSTEM),
+    #         HumanMessage(content=f"Research results:\n{research_context}"),
+    #     ]
+    # )
+    pack = structured_invoke(
+    EvidencePack,
+    [SystemMessage(content=RESEARCH_SYSTEM), HumanMessage(content=f"Research results:\n{research_context}")],
+)
 
     dedup = {e.url: e for e in pack.evidence if e.url}
     return {"evidence": list(dedup.values())}
@@ -287,17 +329,18 @@ def research_node(state: State) -> dict:
 # 5) Router + Orchestrator
 # --------------------------------------------------
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
-        [
-            SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}"),
-        ]
+    decision = structured_invoke(
+        RouterDecision,
+        [SystemMessage(content=ROUTER_SYSTEM), HumanMessage(content=f"Topic: {state['topic']}")],
     )
+
+    # dedupe (order safe) + hard cap
+    queries = list(dict.fromkeys(q.strip() for q in decision.queries if q.strip()))[:MAX_QUERIES]
+
     return {
-        "needs_research": decision.needs_research,
+        "needs_research": decision.needs_research and bool(queries),
         "mode": decision.mode,
-        "queries": decision.queries,
+        "queries": queries,
     }
 
 
@@ -310,19 +353,20 @@ def orchestrator_node(state: State) -> dict:
     evidence = state.get("evidence", [])
     mode = state.get("mode", "closed_book")
 
-    plan = planner.invoke(
-        [
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n\n"
-                    f"Evidence (ONLY use for fresh claims; may be empty):\n"
-                    f"{[e.model_dump() for e in evidence[:16]]}"
-                )
-            ),
-        ]
-    )
+    plan = structured_invoke(
+    Plan,
+    [
+        SystemMessage(content=ORCH_SYSTEM),
+        HumanMessage(
+            content=(
+                f"Topic: {state['topic']}\n"
+                f"Mode: {mode}\n\n"
+                f"Evidence (ONLY use for fresh claims; may be empty):\n"
+                f"{[e.model_dump() for e in evidence[:16]]}"
+            )
+        ),
+    ],
+)
     return {"plan": plan}
 
 

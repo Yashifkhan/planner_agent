@@ -620,4 +620,4 @@ def run(topic: str):
     return out
 
 # result=app.invoke({"topic":"write a blog on self attention","section":[]})
-print("planer agent response -->>",run("write a blog about the gpt 6 astra"))
+# print("planer agent response -->>",run("write a blog about the gpt 6 astra"))

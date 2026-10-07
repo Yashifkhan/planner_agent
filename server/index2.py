@@ -129,9 +129,9 @@ EXAMPLES = [
 
 @st.cache_resource(show_spinner=False)
 def load_backend():
-    import main  # heavy imports + LLM client created once, not on every rerun
+    import main2  # heavy imports + LLM client created once, not on every rerun
 
-    return main
+    return main2
 
 
 def stepper_html(status: dict, detail: dict) -> str:
@@ -157,6 +157,7 @@ def dump(obj):
 # --------------------------------------------------
 def execute(topic: str, stepper_ph, bar_ph, log_ph) -> dict:
     backend = load_backend()
+    print("backend ->>",backend)
     state = backend.initial_state(topic)
 
     status = {k: "pending" for k, _ in STAGES}
@@ -179,7 +180,7 @@ def execute(topic: str, stepper_ph, bar_ph, log_ph) -> dict:
     paint()
     current = "router"
     try:
-        for chunk in backend.app.stream(state, stream_mode="updates"):
+        for chunk in backend.app.stream(state, stream_mode="updates", config={"max_concurrency": 3}):
             for node, upd in chunk.items():
                 if not upd:
                     continue
@@ -346,20 +347,20 @@ OUTPUT_DIR = Path(os.getenv("PLANNER_OUTPUT_DIR", "outputs"))
 
 with st.sidebar:
     st.markdown("**Setup**")
-    for key in (NVIDIA_API_KEY, "TAVILY_API_KEY"):
+
+    nv = st.text_input("NVIDIA API key", type="password", value=os.getenv("NVIDIA_API_KEY", ""))
+    tv = st.text_input("Tavily API key", type="password", value=os.getenv("TAVILY_API_KEY", ""))
+    if nv:
+        os.environ["NVIDIA_API_KEY"] = nv
+    if tv:
+        os.environ["TAVILY_API_KEY"] = tv
+
+    for key in ("NVIDIA_API_KEY", "TAVILY_API_KEY"):
         ok = bool(os.getenv(key))
         st.markdown(f"{'🟢' if ok else '🔴'} {key}")
+
     st.caption(f"Model: {os.getenv('PLANNER_MODEL', 'nvidia/nemotron-3-super-120b-a12b')}")
     st.divider()
-    st.markdown("**History**")
-    if not st.session_state["history"]:
-        st.caption("Your runs this session show up here.")
-    for i, h in enumerate(reversed(st.session_state["history"])):
-        if st.button(h["topic"][:38], key=f"hist_{i}"):
-            st.session_state["result"] = h
-    if st.session_state["history"] and st.button("Clear history", key="clear_hist"):
-        st.session_state["history"], st.session_state["result"] = [], None
-        st.rerun()
 
 # --------------------------------------------------
 # Main layout
